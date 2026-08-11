@@ -80,6 +80,8 @@ public class RocketMQMessageProvider implements MessageProvider {
     private static final int MAX_PROPERTY_VALUE_CHARS = 1024;
     private static final long ONE_HOUR_MILLIS = 3600_000L;
     private static final long ONE_DAY_MILLIS = 24 * ONE_HOUR_MILLIS;
+    private static final long MAX_TRACE_LOOKBACK_MILLIS = 7 * ONE_DAY_MILLIS;
+    private static final long TRACE_TIME_SKEW_MILLIS = 5 * 60_000L;
     private static final int MAX_CONSECUTIVE_OFFSET_ILLEGAL = 3;
 
     private final RuntimeAdminClientResolver runtimeAdminClientResolver;
@@ -265,27 +267,29 @@ public class RocketMQMessageProvider implements MessageProvider {
 
     @Override
     public TraceRecordVO getMessageTrace(String instanceId, String msgId) {
-        return runtimeAdminClientResolver.execute(instanceId,
-                adminExt -> getMessageTrace(instanceId, (DefaultMQAdminExt) adminExt, msgId));
+        return getMessageTrace(instanceId, msgId, null);
     }
 
-    private TraceRecordVO getMessageTrace(String instanceId, DefaultMQAdminExt adminExt, String msgId) {
+    @Override
+    public TraceRecordVO getMessageTrace(String instanceId, String msgId, Long storeTime) {
+        return runtimeAdminClientResolver.execute(instanceId,
+                adminExt -> getMessageTrace(instanceId, (DefaultMQAdminExt) adminExt, msgId, storeTime));
+    }
+
+    private TraceRecordVO getMessageTrace(String instanceId, DefaultMQAdminExt adminExt,
+                                          String msgId, Long storeTime) {
 
         long now = System.currentTimeMillis();
         long begin;
         long end;
-        long messageStoreTimestamp = resolveMessageStoreTimestamp(adminExt, msgId);
+        long messageStoreTimestamp = normalizeTraceStoreTime(storeTime, now);
         if (messageStoreTimestamp > 0) {
-            // Derive the trace query window from the message's own store timestamp
-            // instead of a hardcoded 1-hour lookback. This ensures traces for messages
-            // older than 1 hour are still found as long as the trace data is retained
-            // on the broker (default fileReservedTime = 72 hours).
-            long traceBuffer = 5 * 60_000L;
-            begin = messageStoreTimestamp - traceBuffer;
+            begin = messageStoreTimestamp - TRACE_TIME_SKEW_MILLIS;
             end = Math.max(messageStoreTimestamp + ONE_DAY_MILLIS, now + 60_000L);
         } else {
-            // Fallback: use the existing 1-hour window if the message can't be located
-            log.warn("Could not resolve store timestamp for msgId={}, falling back to 1h trace window", msgId);
+            if (storeTime != null) {
+                log.warn("Invalid storeTime={} for msgId={}, falling back to 1h trace window", storeTime, msgId);
+            }
             begin = now - ONE_HOUR_MILLIS;
             end = now + 60_000L;
         }
@@ -314,23 +318,16 @@ public class RocketMQMessageProvider implements MessageProvider {
                 .build();
     }
 
-    /**
-     * Attempts to resolve the store timestamp of the original message so the trace
-     * query window can be derived from the message's own timeline rather than the
-     * current time. Returns 0 if the message cannot be located.
-     */
-    private long resolveMessageStoreTimestamp(DefaultMQAdminExt adminExt, String msgId) {
-        try {
-            // No topic hint is available in the trace flow, so locate the message purely
-            // by its offset msgId.
-            MessageExt messageExt = viewMessageByOffsetId(adminExt, msgId);
-            if (messageExt != null) {
-                return messageExt.getStoreTimestamp();
-            }
-        } catch (Exception e) {
-            log.debug("Could not view message {} for trace timestamp: {}", msgId, e.getMessage());
+    private long normalizeTraceStoreTime(Long storeTime, long now) {
+        // The value is a client-supplied query hint, so keep it bounded before building the range.
+        if (storeTime == null || storeTime <= 0) {
+            return 0L;
         }
-        return 0L;
+        if (storeTime > now + TRACE_TIME_SKEW_MILLIS
+                || storeTime < now - MAX_TRACE_LOOKBACK_MILLIS) {
+            return 0L;
+        }
+        return storeTime;
     }
 
     /**
